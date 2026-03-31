@@ -60,6 +60,7 @@ public class SecurityConfig {
                                 "/api-docs/**",
                                 "/v3/api-docs/**"
                         ).permitAll()
+                        .requestMatchers("/api/categories/**").authenticated()
                         .requestMatchers("/actuator/health").permitAll()
                         .requestMatchers("/api/utilisateurs/**")
                         .hasAuthority("ROLE_PHARMACIEN")

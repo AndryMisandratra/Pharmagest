@@ -9,11 +9,23 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.stream.Collectors;
+
+import com.itextpdf.kernel.colors.ColorConstants;
+import com.itextpdf.kernel.pdf.PdfDocument;
+import com.itextpdf.kernel.pdf.PdfWriter;
+import com.itextpdf.layout.Document;
+import com.itextpdf.layout.element.Cell;
+import com.itextpdf.layout.element.Paragraph;
+import com.itextpdf.layout.element.Table;
+import com.itextpdf.layout.properties.TextAlignment;
+import com.itextpdf.layout.properties.UnitValue;
+import java.io.ByteArrayOutputStream;
 
 @Service
 @RequiredArgsConstructor
@@ -63,7 +75,6 @@ public class VenteService {
                             "Ordonnance non trouvée"
                     ));
 
-            // Vérifier que l'ordonnance n'est pas déjà servie
             if (ordonnance.getStatut() ==
                     Ordonnance.StatutOrdonnance.SERVIE) {
                 throw new RuntimeException(
@@ -73,13 +84,12 @@ public class VenteService {
         }
 
         // 4. Générer la référence unique
-        // Format : V-20250315-0042
         String reference = genererReference();
 
         // 5. Initialiser les totaux
-        BigDecimal totalHt = BigDecimal.ZERO;
-        BigDecimal totalTva = BigDecimal.ZERO;
-        BigDecimal totalTtc = BigDecimal.ZERO;
+        BigDecimal totalHt          = BigDecimal.ZERO;
+        BigDecimal totalTva         = BigDecimal.ZERO;
+        BigDecimal totalTtc         = BigDecimal.ZERO;
         BigDecimal totalRembourseSs = BigDecimal.ZERO;
 
         // 6. Créer la vente (sans lignes pour l'instant)
@@ -116,9 +126,9 @@ public class VenteService {
 
             // Vérifier si ordonnance requise
             if (medicament.getStatutLegal() ==
-                    Medicament.StatutLegal.ORDONNANCE
-                    || medicament.getStatutLegal() ==
-                    Medicament.StatutLegal.ORDONNANCE_SECURISEE) {
+                    Medicament.StatutLegal.ORDONNANCE ||
+                    medicament.getStatutLegal() ==
+                            Medicament.StatutLegal.ORDONNANCE_SECURISEE) {
                 if (ordonnance == null) {
                     throw new RuntimeException(
                             "Ordonnance requise pour : "
@@ -139,7 +149,6 @@ public class VenteService {
             }
 
             // ===== ALGORITHME FEFO =====
-            // Récupère les lots triés par date de péremption ASC
             var lotsFEFO = lotStockRepository
                     .findLotsDisponiblesFEFO(medicament.getId());
 
@@ -151,11 +160,8 @@ public class VenteService {
             }
 
             int quantiteRestante = ligneReq.getQuantite();
-            LotStock lotUtilise = null;
-            int quantitePrelevee = 0;
+            LotStock lotUtilise  = null;
 
-            // Prélever dans les lots en commençant par le plus proche
-            // de la péremption
             for (var lot : lotsFEFO) {
                 if (quantiteRestante <= 0) break;
 
@@ -174,15 +180,15 @@ public class VenteService {
                 lotStockRepository.save(lot);
 
                 quantiteRestante -= aPrelevert;
-                lotUtilise = lot;
-                quantitePrelevee = aPrelevert;
+                lotUtilise        = lot;
 
                 // Enregistrer mouvement SORTIE_VENTE
                 var mouvement = MouvementStock.builder()
                         .medicament(medicament)
                         .lot(lot)
                         .vente(savedVente)
-                        .type(MouvementStock.TypeMouvement.SORTIE_VENTE)
+                        .type(MouvementStock.TypeMouvement
+                                .SORTIE_VENTE)
                         .quantite(aPrelevert)
                         .motif("Vente " + reference)
                         .effectuePar(vendeur)
@@ -190,24 +196,60 @@ public class VenteService {
                 mouvementStockRepository.save(mouvement);
             }
 
-            // Calculer les montants de la ligne
+            // ===== CALCULS FINANCIERS =====
+
             BigDecimal prixUnitaireTtc =
                     medicament.getPrixVenteTtc();
             BigDecimal prixUnitaireHt =
                     medicament.getPrixAchatHt();
             BigDecimal tauxTva = medicament.getTauxTva();
+
             BigDecimal sousTotalTtc = prixUnitaireTtc
                     .multiply(BigDecimal.valueOf(
-                            ligneReq.getQuantite()
+                            ligneReq.getQuantite()))
+                    .setScale(2, RoundingMode.HALF_UP);
+
+            // ✅ Calcul TVA avec RoundingMode
+            // Formule : TVA = TTC - (TTC / (1 + taux/100))
+            BigDecimal diviseurTva = BigDecimal.ONE
+                    .add(tauxTva.divide(
+                            BigDecimal.valueOf(100),
+                            10,
+                            RoundingMode.HALF_UP
                     ));
 
-            // Taux de remboursement SS
-            BigDecimal tauxRembSs = medicament
-                    .getEstRemboursableSs()
-                    ? (medicament.getTauxRemboursementSs() != null
-                    ? medicament.getTauxRemboursementSs()
-                    : BigDecimal.ZERO)
-                    : BigDecimal.ZERO;
+            BigDecimal montantHtLigne = sousTotalTtc
+                    .divide(diviseurTva, 2,
+                            RoundingMode.HALF_UP);
+
+            BigDecimal tvaLigne = sousTotalTtc
+                    .subtract(montantHtLigne)
+                    .setScale(2, RoundingMode.HALF_UP);
+
+            totalTva = totalTva.add(tvaLigne);
+
+            // ✅ Calcul remboursement SS avec RoundingMode
+            BigDecimal tauxRembSs = BigDecimal.ZERO;
+            if (medicament.getEstRemboursableSs() &&
+                    medicament.getTauxRemboursementSs() != null) {
+                tauxRembSs = medicament.getTauxRemboursementSs();
+            }
+
+            BigDecimal rembourseLigne = BigDecimal.ZERO;
+            if (tauxRembSs.compareTo(BigDecimal.ZERO) > 0) {
+                rembourseLigne = sousTotalTtc
+                        .multiply(tauxRembSs)
+                        .divide(
+                                BigDecimal.valueOf(100),
+                                2,
+                                RoundingMode.HALF_UP
+                        );
+            }
+            totalRembourseSs = totalRembourseSs
+                    .add(rembourseLigne);
+
+            // Accumuler total TTC
+            totalTtc = totalTtc.add(sousTotalTtc);
 
             // Créer la ligne de vente
             var ligne = LigneVente.builder()
@@ -224,20 +266,6 @@ public class VenteService {
 
             lignes.add(ligneVenteRepository.save(ligne));
 
-            // Accumuler les totaux
-            totalTtc = totalTtc.add(sousTotalTtc);
-            BigDecimal tvaLigne = sousTotalTtc
-                    .multiply(tauxTva)
-                    .divide(BigDecimal.valueOf(100 + tauxTva
-                            .doubleValue()));
-            totalTva = totalTva.add(tvaLigne);
-
-            // Calculer remboursement SS
-            BigDecimal rembourseLigne = sousTotalTtc
-                    .multiply(tauxRembSs)
-                    .divide(BigDecimal.valueOf(100));
-            totalRembourseSs = totalRembourseSs.add(rembourseLigne);
-
             // Mettre à jour stock total du médicament
             medicament.setStockQuantiteTotale(
                     medicament.getStockQuantiteTotale()
@@ -246,10 +274,14 @@ public class VenteService {
             medicamentRepository.save(medicament);
         }
 
-        // 8. Calculer le total HT
-        totalHt = totalTtc.subtract(totalTva);
-        BigDecimal montantPayeClient =
-                totalTtc.subtract(totalRembourseSs);
+        // 8. Calculer le total HT et montant à payer
+        totalHt = totalTtc
+                .subtract(totalTva)
+                .setScale(2, RoundingMode.HALF_UP);
+
+        BigDecimal montantPayeClient = totalTtc
+                .subtract(totalRembourseSs)
+                .setScale(2, RoundingMode.HALF_UP);
 
         // 9. Mettre à jour la vente avec les totaux
         savedVente.setMontantTotalHt(totalHt);
@@ -293,48 +325,45 @@ public class VenteService {
                 .findByEmail(emailPharmacien)
                 .orElseThrow();
 
-        // Récupérer les lignes de la vente
         var lignes = ligneVenteRepository.findByVenteId(id);
 
         // Restock automatique pour chaque ligne
         for (var ligne : lignes) {
-            var lot = ligne.getLot();
+            var lot        = ligne.getLot();
             var medicament = ligne.getMedicament();
 
-            // Remettre en stock
             lot.setQuantiteRestante(
-                    lot.getQuantiteRestante() + ligne.getQuantite()
+                    lot.getQuantiteRestante()
+                            + ligne.getQuantite()
             );
             lot.setEstActif(true);
             lotStockRepository.save(lot);
 
-            // Mettre à jour stock médicament
             medicament.setStockQuantiteTotale(
                     medicament.getStockQuantiteTotale()
                             + ligne.getQuantite()
             );
             medicamentRepository.save(medicament);
 
-            // Enregistrer mouvement ENTREE_RETOUR
             var mouvement = MouvementStock.builder()
                     .medicament(medicament)
                     .lot(lot)
                     .vente(vente)
-                    .type(MouvementStock.TypeMouvement.ENTREE_RETOUR)
+                    .type(MouvementStock.TypeMouvement
+                            .ENTREE_RETOUR)
                     .quantite(ligne.getQuantite())
-                    .motif("Annulation vente " + vente.getReference())
+                    .motif("Annulation vente "
+                            + vente.getReference())
                     .effectuePar(pharmacien)
                     .build();
             mouvementStockRepository.save(mouvement);
         }
 
-        // Marquer la vente comme annulée
         vente.setStatut(Vente.StatutVente.ANNULEE);
         vente.setAnnuleeLe(LocalDateTime.now());
         vente.setAnnuleePar(pharmacien);
         venteRepository.save(vente);
 
-        // Remettre l'ordonnance en EN_ATTENTE si applicable
         if (vente.getOrdonnance() != null) {
             vente.getOrdonnance().setStatut(
                     Ordonnance.StatutOrdonnance.EN_ATTENTE
@@ -358,12 +387,28 @@ public class VenteService {
     }
 
     // ================================================
+    // LISTER ventes sur une période
+    // ================================================
+    public List<VenteResponse> getVentesParPeriode(
+            LocalDateTime debut,
+            LocalDateTime fin) {
+        return venteRepository
+                .findVentesParPeriode(debut, fin)
+                .stream()
+                .map(v -> toResponse(v,
+                        ligneVenteRepository
+                                .findByVenteId(v.getId())))
+                .collect(Collectors.toList());
+    }
+
+    // ================================================
     // GÉNÉRER une référence unique
     // Format : V-20250315-0042
     // ================================================
     private String genererReference() {
         String date = LocalDateTime.now()
-                .format(DateTimeFormatter.ofPattern("yyyyMMdd"));
+                .format(DateTimeFormatter
+                        .ofPattern("yyyyMMdd"));
         long count = venteRepository.count() + 1;
         return String.format("V-%s-%04d", date, count);
     }
@@ -404,7 +449,8 @@ public class VenteService {
                 .build();
     }
 
-    private LigneVenteResponse toLigneResponse(LigneVente l) {
+    private LigneVenteResponse toLigneResponse(
+            LigneVente l) {
         return LigneVenteResponse.builder()
                 .id(l.getId())
                 .medicamentId(l.getMedicament().getId())
@@ -418,5 +464,271 @@ public class VenteService {
                 .sousTotalTtc(l.getSousTotalTtc())
                 .tauxRemboursement(l.getTauxRemboursement())
                 .build();
+    }
+
+    // ================================================
+// GÉNÉRER le ticket de caisse PDF
+// ================================================
+    public byte[] genererTicketPdf(Long venteId) {
+
+        var vente = venteRepository.findById(venteId)
+                .orElseThrow(() -> new RuntimeException(
+                        "Vente non trouvée : " + venteId
+                ));
+
+        var lignes = ligneVenteRepository
+                .findByVenteId(venteId);
+
+        ByteArrayOutputStream baos =
+                new ByteArrayOutputStream();
+
+        try {
+            PdfWriter writer   = new PdfWriter(baos);
+            PdfDocument pdf    = new PdfDocument(writer);
+            Document document  = new Document(pdf);
+
+            DateTimeFormatter fmt =
+                    DateTimeFormatter.ofPattern("dd/MM/yyyy HH:mm");
+
+            // ===== EN-TÊTE =====
+            document.add(
+                    new Paragraph("💊 PHARMAGEST")
+                            .setFontSize(18)
+                            .setBold()
+                            .setTextAlignment(TextAlignment.CENTER)
+                            .setFontColor(ColorConstants.DARK_GRAY)
+            );
+            document.add(
+                    new Paragraph("Pharmacie Gestion")
+                            .setFontSize(10)
+                            .setTextAlignment(TextAlignment.CENTER)
+                            .setFontColor(ColorConstants.GRAY)
+            );
+            document.add(
+                    new Paragraph(
+                            "─────────────────────────────────")
+                            .setTextAlignment(TextAlignment.CENTER)
+                            .setFontColor(ColorConstants.GRAY)
+            );
+
+            // ===== INFOS VENTE =====
+            document.add(
+                    new Paragraph(
+                            "Ticket N° : " + vente.getReference())
+                            .setFontSize(10)
+                            .setBold()
+            );
+            document.add(
+                    new Paragraph(
+                            "Date : " + vente.getEffectueele()
+                                    .format(fmt))
+                            .setFontSize(9)
+                            .setFontColor(ColorConstants.GRAY)
+            );
+            document.add(
+                    new Paragraph(
+                            "Vendeur : " + vente.getVendeur()
+                                    .getPrenom()
+                                    + " " + vente.getVendeur().getNom())
+                            .setFontSize(9)
+                            .setFontColor(ColorConstants.GRAY)
+            );
+
+            // Patient si présent
+            if (vente.getPatient() != null) {
+                document.add(
+                        new Paragraph(
+                                "Patient : "
+                                        + vente.getPatient().getPrenom()
+                                        + " "
+                                        + vente.getPatient().getNom())
+                                .setFontSize(9)
+                                .setFontColor(ColorConstants.GRAY)
+                );
+            }
+
+            document.add(
+                    new Paragraph(
+                            "─────────────────────────────────")
+                            .setTextAlignment(TextAlignment.CENTER)
+                            .setFontColor(ColorConstants.GRAY)
+            );
+
+            // ===== TABLEAU DES MÉDICAMENTS =====
+            Table table = new Table(
+                    UnitValue.createPercentArray(
+                            new float[]{45, 15, 20, 20}))
+                    .setWidth(UnitValue.createPercentValue(100));
+
+            // En-têtes
+            for (String h : new String[]{
+                    "Médicament", "Qté",
+                    "Prix unit.", "Sous-total"
+            }) {
+                table.addHeaderCell(
+                        new Cell()
+                                .add(new Paragraph(h)
+                                        .setFontSize(8)
+                                        .setBold()
+                                        .setFontColor(
+                                                ColorConstants.WHITE))
+                                .setBackgroundColor(
+                                        ColorConstants.DARK_GRAY)
+                                .setPadding(4)
+                );
+            }
+
+            // Lignes médicaments
+            for (var ligne : lignes) {
+                table.addCell(
+                        new Cell()
+                                .add(new Paragraph(
+                                        ligne.getMedicament()
+                                                .getDenomination())
+                                        .setFontSize(8))
+                                .setPadding(3)
+                );
+                table.addCell(
+                        new Cell()
+                                .add(new Paragraph(
+                                        String.valueOf(
+                                                ligne.getQuantite()))
+                                        .setFontSize(8)
+                                        .setTextAlignment(
+                                                TextAlignment.CENTER))
+                                .setPadding(3)
+                );
+                table.addCell(
+                        new Cell()
+                                .add(new Paragraph(
+                                        ligne.getPrixUnitaireTtc().toString()
+                                                + " Ar")
+                                        .setFontSize(8)
+                                        .setTextAlignment(
+                                                TextAlignment.RIGHT))
+                                .setPadding(3)
+                );
+                table.addCell(
+                        new Cell()
+                                .add(new Paragraph(
+                                        ligne.getSousTotalTtc()
+                                                .toPlainString()
+                                                + " Ar")
+                                        .setFontSize(8)
+                                        .setTextAlignment(
+                                                TextAlignment.RIGHT))
+                                .setPadding(3)
+                );
+            }
+
+            document.add(table);
+            document.add(
+                    new Paragraph(
+                            "─────────────────────────────────")
+                            .setFontColor(ColorConstants.GRAY)
+            );
+
+            // ===== TOTAUX =====
+            document.add(
+                    new Paragraph(
+                            "Total HT : "
+                                    + vente.getMontantTotalHt()
+                                    .toPlainString()
+                                    + " Ar")
+                            .setFontSize(9)
+                            .setTextAlignment(TextAlignment.RIGHT)
+            );
+            document.add(
+                    new Paragraph(
+                            "TVA : "
+                                    + vente.getMontantTva()
+                                    .toPlainString()
+                                    + " Ar")
+                            .setFontSize(9)
+                            .setTextAlignment(TextAlignment.RIGHT)
+                            .setFontColor(ColorConstants.GRAY)
+            );
+
+            if (vente.getMontantRembourseSs()
+                    .compareTo(BigDecimal.ZERO) > 0) {
+                document.add(
+                        new Paragraph(
+                                "Remboursement SS : -"
+                                        + vente.getMontantRembourseSs()
+                                        .toPlainString()
+                                        + " Ar")
+                                .setFontSize(9)
+                                .setTextAlignment(
+                                        TextAlignment.RIGHT)
+                                .setFontColor(ColorConstants.GREEN)
+                );
+            }
+
+            document.add(
+                    new Paragraph(
+                            "TOTAL TTC : "
+                                    + vente.getMontantTotalTtc()
+                                    .toPlainString()
+                                    + " Ar")
+                            .setFontSize(12)
+                            .setBold()
+                            .setTextAlignment(TextAlignment.RIGHT)
+            );
+            document.add(
+                    new Paragraph(
+                            "À PAYER : "
+                                    + vente.getMontantPayeClient()
+                                    .toPlainString()
+                                    + " Ar")
+                            .setFontSize(14)
+                            .setBold()
+                            .setTextAlignment(TextAlignment.RIGHT)
+                            .setFontColor(ColorConstants.DARK_GRAY)
+            );
+
+            // ===== MODE PAIEMENT =====
+            document.add(
+                    new Paragraph(
+                            "─────────────────────────────────")
+                            .setFontColor(ColorConstants.GRAY)
+            );
+            document.add(
+                    new Paragraph(
+                            "Mode de paiement : "
+                                    + vente.getModePaiement().name())
+                            .setFontSize(9)
+            );
+
+            // ===== PIED DE PAGE =====
+            document.add(
+                    new Paragraph(
+                            "─────────────────────────────────")
+                            .setFontColor(ColorConstants.GRAY)
+            );
+            document.add(
+                    new Paragraph(
+                            "Merci de votre confiance !")
+                            .setFontSize(9)
+                            .setTextAlignment(TextAlignment.CENTER)
+                            .setFontColor(ColorConstants.GRAY)
+            );
+            document.add(
+                    new Paragraph(
+                            "PharmaGest — Votre santé, notre priorité")
+                            .setFontSize(8)
+                            .setTextAlignment(TextAlignment.CENTER)
+                            .setFontColor(ColorConstants.LIGHT_GRAY)
+            );
+
+            document.close();
+
+        } catch (Exception e) {
+            throw new RuntimeException(
+                    "Erreur génération ticket PDF : "
+                            + e.getMessage()
+            );
+        }
+
+        return baos.toByteArray();
     }
 }

@@ -42,7 +42,7 @@ public class LotStock {
     private LocalDate dateFabrication;
 
     // Critère FEFO : ORDER BY lot_date_peremption ASC
-    @Column(name = "lot_date_peremption", nullable = false)
+    @Column(name = "lot_date_peremption", nullable = true)
     private LocalDate datePeremption;
 
     // Prix d'achat de CE lot (peut différer du catalogue)
